@@ -42,6 +42,15 @@ struct proc_dlatch_db_t
 	dict<SigBit, int> sigusers;
 	pool<SigBit> active_bits;
 
+	// Per-query memoization for find_mux_feedback: the mux network is a DAG
+	// (a bit can be driven through many muxes whose inputs share deeper
+	// nodes), and the un-memoized recursion re-explores every shared subtree
+	// once per path, which is exponential in practice (a 16-entry TLB
+	// update_flush with ~950 muxes and nodes shared 16 ways never finishes).
+	// Valid only within one top-level (haystack, needle) query — cleared on
+	// entry.  Indexed by [set_undef], since the flag changes the walk.
+	dict<SigBit, int> feedback_memo[2];
+
 	proc_dlatch_db_t(Module *module) : module(module), sigmap(module)
 	{
 		initvals.set(&sigmap, module);
@@ -181,11 +190,22 @@ struct proc_dlatch_db_t
 
 	int find_mux_feedback(SigBit haystack, SigBit needle, bool set_undef)
 	{
+		feedback_memo[0].clear();
+		feedback_memo[1].clear();
+		return find_mux_feedback_rec(haystack, needle, set_undef);
+	}
+
+	int find_mux_feedback_rec(SigBit haystack, SigBit needle, bool set_undef)
+	{
 		if (sigusers[haystack] > 1)
 			set_undef = false;
 
 		if (haystack == needle)
 			return true_node;
+
+		auto memo_it = feedback_memo[set_undef].find(haystack);
+		if (memo_it != feedback_memo[set_undef].end())
+			return memo_it->second;
 
 		auto it = mux_drivers.find(haystack);
 		if (it == mux_drivers.end())
@@ -205,7 +225,7 @@ struct proc_dlatch_db_t
 
 		pool<int> children;
 
-		int n = find_mux_feedback(sig_a[index], needle, set_undef);
+		int n = find_mux_feedback_rec(sig_a[index], needle, set_undef);
 		if (n != false_node) {
 			if (set_undef && sig_a[index] == needle) {
 				SigSpec sig = cell->getPort(ID::A);
@@ -228,7 +248,7 @@ struct proc_dlatch_db_t
 		}
 
 		for (int i = 0; i < (is_bwmux ? 1 : GetSize(sig_s)); i++) {
-			n = find_mux_feedback(sig_b[i*width + index], needle, set_undef);
+			n = find_mux_feedback_rec(sig_b[i*width + index], needle, set_undef);
 			if (n != false_node) {
 				if (set_undef && sig_b[i*width + index] == needle) {
 					SigSpec sig = cell->getPort(ID::B);
@@ -248,19 +268,34 @@ struct proc_dlatch_db_t
 
 		active_bits.erase(haystack);
 
-		if (children.empty())
+		if (children.empty()) {
+			feedback_memo[set_undef][haystack] = false_node;
 			return false_node;
+		}
 
-		return make_inner(children);
+		int result = make_inner(children);
+		feedback_memo[set_undef][haystack] = result;
+		return result;
 	}
 
 	int find_mux_constant(SigBit haystack, State needle, bool set_undef)
+	{
+		feedback_memo[0].clear();
+		feedback_memo[1].clear();
+		return find_mux_constant_rec(haystack, needle, set_undef);
+	}
+
+	int find_mux_constant_rec(SigBit haystack, State needle, bool set_undef)
 	{
 		if (sigusers[haystack] > 1)
 			set_undef = false;
 
 		if (haystack == SigBit(needle))
 			return true_node;
+
+		auto memo_it = feedback_memo[set_undef].find(haystack);
+		if (memo_it != feedback_memo[set_undef].end())
+			return memo_it->second;
 
 		auto it = mux_drivers.find(haystack);
 		if (it == mux_drivers.end())
@@ -280,7 +315,7 @@ struct proc_dlatch_db_t
 
 		pool<int> children;
 
-		int n = find_mux_constant(sig_a[index], needle, set_undef);
+		int n = find_mux_constant_rec(sig_a[index], needle, set_undef);
 		if (n != false_node) {
 			if (set_undef && sig_a[index] == SigBit(needle)) {
 				SigSpec sig = cell->getPort(ID::A);
@@ -297,7 +332,7 @@ struct proc_dlatch_db_t
 		}
 
 		for (int i = 0; i < (is_bwmux ? 1 : GetSize(sig_s)); i++) {
-			n = find_mux_constant(sig_b[i*width + index], needle, set_undef);
+			n = find_mux_constant_rec(sig_b[i*width + index], needle, set_undef);
 			if (n != false_node) {
 				if (set_undef && sig_b[i*width + index] == SigBit(needle)) {
 					SigSpec sig = cell->getPort(ID::B);
@@ -310,10 +345,14 @@ struct proc_dlatch_db_t
 
 		active_bits.erase(haystack);
 
-		if (children.empty())
+		if (children.empty()) {
+			feedback_memo[set_undef][haystack] = false_node;
 			return false_node;
+		}
 
-		return make_inner(children);
+		int result = make_inner(children);
+		feedback_memo[set_undef][haystack] = result;
+		return result;
 	}
 
 	SigBit make_hold(int n, string &src)
